@@ -564,7 +564,7 @@ var_check() {
     return 0
   fi
   while IFS= read -r f; do
-    [ -n "$f" ] && [ -f "$f" ] || continue
+    if [ -z "$f" ] || [ ! -f "$f" ]; then continue; fi
     keys=$(env_keys "$f")
     case "$nl$keys$nl" in
       *"$nl$name${tab}1$nl"*) record ok "$name is set ($f)"; return 0 ;;

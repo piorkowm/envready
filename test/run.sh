@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests are called by name from the list at the bottom, which shellcheck
 # cannot follow.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2329,SC2317
 #
 # Test harness for envready. No dependencies beyond bash, git and python3
 # (python3 only to check that --json output parses).
