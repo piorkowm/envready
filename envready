@@ -1,0 +1,779 @@
+#!/usr/bin/env bash
+# envready: is this project ready to run here?
+#
+#   ./envready            every check, one line each
+#   ./envready -q         failures only
+#   ./envready --json     machine-readable results (for scripts and agents)
+#   ./envready --init     write a starter envready.conf (never overwrites)
+#   ./envready DIR        check another directory
+#
+# Run it after cloning a project, or after moving to a new machine, container
+# or sandbox. A half-restored environment looks exactly like a working one
+# until you trip over the missing piece; this is the cheap way to find it first.
+#
+# Three rules, and the script is written around them:
+#
+#   1. It never prints, logs or sends a secret's value. It may say a key is
+#      missing or empty, never what it contains. Values are read only to ask
+#      "is this empty?", inside one awk program, and never leave it.
+#   2. No network, and it changes nothing. The only write is --init, which
+#      refuses to overwrite. (The `cmd` lines in envready.conf are commands the
+#      project chose to run; --no-cmd skips them.)
+#   3. Every failure names its fix: a command to run or a page to open.
+#
+# Exit 0 when every check passes, 1 when any fails, 2 on a usage error.
+#
+# Portable bash: works on bash 3.2 (the macOS default) and later, with only
+# POSIX tools besides (awk, sed, grep, tr) and git when it is there.
+#
+# https://github.com/piorkowm/envready  (MIT license)
+
+set -u
+
+version=0.1.0
+
+usage() {
+  cat <<'EOF'
+usage: envready [-q] [--json] [--no-cmd] [DIR]
+       envready --init [DIR]
+
+Checks whether the project in DIR (default: the current directory) is ready
+to run on this machine. One line per check; every FAIL prints its fix.
+
+  -q, --quiet   print failures only (silent when everything passes)
+  --json        print results as JSON on stdout
+  --no-cmd      do not run the `cmd` checks from envready.conf
+  --init        write a starter envready.conf from what is detected here
+  -V, --version print the version
+  -h, --help    print this help
+
+Exit status: 0 all checks passed, 1 something failed, 2 usage error.
+Config format and more: https://github.com/piorkowm/envready
+EOF
+}
+
+quiet=0
+json=0
+init=0
+nocmd=0
+dir=.
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -q|--quiet)   quiet=1 ;;
+    --json)       json=1 ;;
+    --init)       init=1 ;;
+    --no-cmd)     nocmd=1 ;;
+    -V|--version) echo "envready $version"; exit 0 ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; [ $# -gt 0 ] && dir=$1; break ;;
+    -*)           echo "envready: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)            dir=$1 ;;
+  esac
+  shift
+done
+
+if ! cd "$dir" 2>/dev/null; then
+  echo "envready: cannot open directory: $dir" >&2
+  exit 2
+fi
+here=$(pwd)
+
+tab=$(printf '\t')
+cr=$(printf '\r')
+nl='
+'
+
+# --- output -----------------------------------------------------------------
+#
+# Every check goes through record(). Internal variables are lowercase on
+# purpose: environment variables are uppercase by convention, and the
+# "is KEY set in the environment" lookup must never see one of ours.
+
+n_pass=0
+n_fail=0
+n_warn=0
+section_name=""
+section_shown=0
+json_items=""
+
+if [ "$json" = 0 ] && [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != dumb ]; then
+  c_ok=$(printf '\033[32m'); c_fail=$(printf '\033[31m'); c_warn=$(printf '\033[33m')
+  c_dim=$(printf '\033[2m'); c_off=$(printf '\033[0m')
+else
+  c_ok=""; c_fail=""; c_warn=""; c_dim=""; c_off=""
+fi
+
+section() {
+  [ "$1" = "$section_name" ] && return 0
+  section_name=$1
+  section_shown=0
+}
+
+# json_esc STRING: sets $esc to STRING escaped for a JSON string body.
+json_esc() {
+  local s=$1 bs="\\" q='"'
+  s=${s//"$bs"/"$bs$bs"}
+  s=${s//"$q"/"$bs$q"}
+  s=${s//"$tab"/"${bs}t"}
+  s=${s//"$nl"/"${bs}n"}
+  s=${s//"$cr"/"${bs}r"}
+  case "$s" in
+    *[[:cntrl:]]*) s=$(printf '%s' "$s" | tr -d '\000-\037\177') ;;
+  esac
+  esc=$s
+}
+
+# record STATUS MESSAGE [FIX]   STATUS is ok, fail or warn.
+record() {
+  local st=$1 msg=$2 fix=${3:-} label color item
+  case "$st" in
+    ok)   n_pass=$((n_pass + 1)); label="ok";   color=$c_ok ;;
+    fail) n_fail=$((n_fail + 1)); label="FAIL"; color=$c_fail ;;
+    *)    n_warn=$((n_warn + 1)); label="warn"; color=$c_warn; st=warn ;;
+  esac
+
+  if [ "$json" = 1 ]; then
+    json_esc "$section_name"; item="{\"status\":\"$st\",\"section\":\"$esc\""
+    json_esc "$msg";          item="$item,\"check\":\"$esc\""
+    json_esc "$fix";          item="$item,\"fix\":\"$esc\"}"
+    json_items="$json_items${json_items:+,}$item"
+    return 0
+  fi
+
+  if [ "$quiet" = 1 ]; then
+    [ "$st" = fail ] || return 0
+  elif [ "$section_shown" = 0 ]; then
+    section_shown=1
+    printf '\n%s\n' "$section_name"
+  fi
+  printf '  %s%-4s%s  %s\n' "$color" "$label" "$c_off" "$msg"
+  if [ -n "$fix" ]; then
+    printf '        %s->%s %s\n' "$c_dim" "$c_off" "$fix"
+  fi
+  return 0
+}
+
+# --- reading .env files without reading secrets ------------------------------
+#
+# Prints one line per key: KEY<TAB>1 when it has a non-empty value, KEY<TAB>0
+# when it is empty. The value itself never leaves awk. Handles comments, blank
+# lines, `export ` prefixes, quoted values with inline comments after them, and
+# quoted values that run over several lines (a PEM key, for example), so that a
+# line inside one is never mistaken for a key and its text never printed.
+
+IFS= read -r -d '' env_awk <<'AWK'
+function closepos(s, q,    i, c) {
+  for (i = 1; i <= length(s); i++) {
+    c = substr(s, i, 1)
+    if (q == "\"" && c == "\\") { i++; continue }
+    if (c == q) return i
+  }
+  return 0
+}
+{
+  sub(/\r$/, "")
+  line = $0
+  if (inq != "") {
+    if (closepos(line, inq) > 0) inq = ""
+    next
+  }
+  sub(/^[ \t]+/, "", line)
+  if (line == "" || substr(line, 1, 1) == "#") next
+  if (line ~ /^export[ \t]+/) sub(/^export[ \t]+/, "", line)
+  if (line !~ /^[A-Za-z_][A-Za-z0-9_]*[ \t]*=/) next
+  eq = index(line, "=")
+  key = substr(line, 1, eq - 1)
+  sub(/[ \t]+$/, "", key)
+  val = substr(line, eq + 1)
+  if (val ~ /^[ \t]*#/) val = ""
+  sub(/^[ \t]+/, "", val)
+  q = substr(val, 1, 1)
+  if (q == "\"" || q == "\047" || q == "`") {
+    p = closepos(substr(val, 2), q)
+    if (p == 0) { inq = q; set = 1 } else { set = (p > 1) }
+  } else {
+    sub(/[ \t]+#.*$/, "", val)
+    sub(/[ \t]+$/, "", val)
+    set = (val != "")
+  }
+  if (!(key in seen)) { seen[key] = 1; order[++n] = key }
+  isset[key] = set
+}
+END { for (i = 1; i <= n; i++) print order[i] "\t" isset[order[i]] }
+AWK
+
+env_keys() { awk "$env_awk" "$1" 2>/dev/null; }
+
+# in_environment NAME: true when NAME is exported and non-empty. Asks printenv
+# (a child process) so only the real environment counts, and the value is
+# compared with "" and dropped, never printed.
+in_environment() {
+  case "$1" in ''|[!A-Za-z_]*|*[!A-Za-z0-9_]*) return 1 ;; esac
+  [ -n "$(printenv "$1" 2>/dev/null)" ]
+}
+
+# --- git --------------------------------------------------------------------
+
+in_git=0
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  in_git=1
+fi
+
+# git_secret_file FILE: a secrets file must be ignored and must not be tracked.
+git_secret_file() {
+  local f=$1
+  [ "$in_git" = 1 ] || return 0
+  if git ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then
+    record fail "$f is committed to git" \
+      "git rm --cached '$f' && git commit -m 'Stop tracking $f', then rotate every key in it (it stays in git history)"
+  fi
+  if git check-ignore -q --no-index -- "$f" 2>/dev/null; then
+    record ok "$f is git-ignored"
+  else
+    record fail "$f is not git-ignored" "echo '$f' >> .gitignore"
+  fi
+}
+
+# --- env: example file vs actual file -----------------------------------------
+
+env_actuals=""
+
+env_compare() {
+  local ex=$1 act=$2 exk actk k s total=0 good=0 fromenv=0 missing=0
+  env_actuals="$env_actuals$act$nl"
+  section "env: $ex vs $act"
+
+  if [ ! -f "$ex" ]; then
+    record fail "$ex does not exist" "create $ex listing every key the project needs (names only, no values), or fix the path in envready.conf"
+    return 0
+  fi
+  exk=$(env_keys "$ex")
+
+  if [ ! -f "$act" ]; then
+    while IFS="$tab" read -r k s; do
+      [ -n "$k" ] || continue
+      total=$((total + 1))
+      in_environment "$k" || missing=$((missing + 1))
+    done <<EOF
+$exk
+EOF
+    if [ "$missing" = 0 ] && [ "$total" -gt 0 ]; then
+      record ok "$act does not exist, but all $total keys from $ex are set in the environment"
+    else
+      record fail "$act does not exist ($missing of $total keys in $ex are not set in the environment either)" \
+        "cp '$ex' '$act', then fill in each value"
+    fi
+    git_secret_file "$act"
+    return 0
+  fi
+
+  actk=$(env_keys "$act")
+  while IFS="$tab" read -r k s; do
+    [ -n "$k" ] || continue
+    total=$((total + 1))
+    case "$nl$actk$nl" in
+      *"$nl$k${tab}1$nl"*)
+        good=$((good + 1)) ;;
+      *"$nl$k${tab}0$nl"*)
+        if in_environment "$k"; then
+          fromenv=$((fromenv + 1))
+        else
+          record fail "$k is empty in $act" "fill in a value for $k in $act"
+        fi ;;
+      *)
+        if in_environment "$k"; then
+          fromenv=$((fromenv + 1))
+        else
+          record fail "$k is missing from $act" "add a line $k=<value> to $act ($ex lists it)"
+        fi ;;
+    esac
+  done <<EOF
+$exk
+EOF
+
+  if [ "$total" = 0 ]; then
+    record warn "$ex lists no keys" "add one KEY= line per setting the project needs, or delete $ex"
+  elif [ $((good + fromenv)) = "$total" ]; then
+    if [ "$fromenv" -gt 0 ]; then
+      record ok "all $total keys from $ex are set ($fromenv of them in the environment)"
+    else
+      record ok "all $total keys from $ex are set in $act"
+    fi
+  fi
+
+  while IFS="$tab" read -r k s; do
+    [ -n "$k" ] || continue
+    case "$nl$exk$nl" in
+      *"$nl$k$tab"[01]"$nl"*) ;;
+      *) record warn "$k is in $act but not in $ex" \
+           "add $k= (no value) to $ex so the next person knows it is needed, or remove it from $act if nothing uses it" ;;
+    esac
+  done <<EOF
+$actk
+EOF
+
+  git_secret_file "$act"
+}
+
+# --- binaries -----------------------------------------------------------------
+
+checked_bins=" "
+
+check_bin() {  # check_bin NAME FIX
+  local b=$1 fix=$2 p
+  case "$checked_bins" in *" $b "*) return 0 ;; esac
+  checked_bins="$checked_bins$b "
+  if p=$(command -v "$b" 2>/dev/null) && [ -n "$p" ]; then
+    record ok "$b ($p)"
+  else
+    record fail "$b is not installed (not found on PATH)" "$fix"
+  fi
+}
+
+has() { command -v "$1" >/dev/null 2>&1; }
+
+# Major-version check of package.json engines.node, done by node itself so no
+# JSON tool is needed. Best effort: it compares major versions only, and says
+# so when it cannot read the range.
+IFS= read -r -d '' engines_js <<'JS'
+var fs = require("fs"), p;
+try { p = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (e) { process.stdout.write("unreadable\t\t"); process.exit(0); }
+var r = (p && p.engines && typeof p.engines.node === "string") ? p.engines.node.trim() : "";
+var v = process.versions.node, M = +v.split(".")[0], known = true;
+function alt(a) {
+  a = a.trim().replace(/(>=|<=|>|<|=|\^|~)\s+/g, "$1");
+  if (a === "" || a === "*" || a === "x" || a === "latest") return true;
+  var h = a.match(/^v?(\d+)\S*\s+-\s+v?(\d+)/);
+  if (h) return M >= +h[1] && M <= +h[2];
+  return a.split(/\s+/).every(function (c) {
+    var m = c.match(/^(>=|<=|>|<|=|\^|~)?v?(\d+)((?:\.(?:\d+|x|\*))*)/);
+    if (!m) { known = false; return true; }
+    var n = +m[2], op = m[1] || "", more = /[1-9]/.test(m[3] || "");
+    if (op === ">=" || op === ">") return M >= n;
+    if (op === "<") return more ? M <= n : M < n;
+    if (op === "<=") return M <= n;
+    return M === n;
+  });
+}
+var ok = r === "" ? true : r.split("||").some(alt);
+process.stdout.write((r === "" ? "none" : !known ? "unknown" : ok ? "ok" : "fail") + "\t" + v + "\t" + r);
+JS
+
+node_checks() {
+  local pm=npm pmfield pmfix res st nv range want have
+  section "project: node (package.json)"
+  check_bin node "install Node.js from https://nodejs.org/en/download (or with nvm: https://github.com/nvm-sh/nvm)"
+
+  pmfield=$(sed -n 's/.*"packageManager"[[:space:]]*:[[:space:]]*"\([a-z]*\)@.*/\1/p' package.json 2>/dev/null | head -n 1)
+  if [ -f pnpm-lock.yaml ]; then pm=pnpm
+  elif [ -f yarn.lock ]; then pm=yarn
+  elif [ -f bun.lockb ] || [ -f bun.lock ]; then pm=bun
+  elif [ -n "$pmfield" ]; then pm=$pmfield
+  fi
+  case "$pm" in
+    pnpm) pmfix="npm install -g pnpm (or: corepack enable pnpm)" ;;
+    yarn) pmfix="npm install -g yarn (or: corepack enable yarn)" ;;
+    bun)  pmfix="install Bun from https://bun.sh" ;;
+    *)    pm=npm; pmfix="npm comes with Node.js: reinstall it from https://nodejs.org/en/download" ;;
+  esac
+  check_bin "$pm" "$pmfix"
+
+  if has node; then
+    res=$(node -e "$engines_js" "$here/package.json" 2>/dev/null)
+    st=${res%%"$tab"*}; res=${res#*"$tab"}
+    nv=${res%%"$tab"*}; range=${res#*"$tab"}
+    case "$st" in
+      ok)      record ok "node $nv matches engines.node \"$range\"" ;;
+      fail)    record fail "node $nv does not match engines.node \"$range\" in package.json" \
+                 "install a matching Node.js (with nvm: nvm install $(printf '%s' "$range" | sed 's/[^0-9]*\([0-9][0-9]*\).*/\1/'))" ;;
+      unknown) record warn "could not read engines.node \"$range\" (node is $nv)" "check by hand that node $nv fits \"$range\"" ;;
+      unreadable) record fail "package.json is not valid JSON" "fix the syntax error in package.json (node -e 'require(\"./package.json\")' shows where)" ;;
+    esac
+
+    for f in .nvmrc .node-version; do
+      [ -f "$f" ] || continue
+      want=$(sed -n '1{s/^[[:space:]v]*//;s/[^0-9].*//;p;}' "$f")
+      have=$(node -v 2>/dev/null | sed 's/^v//;s/[^0-9].*//')
+      if [ -z "$want" ]; then
+        continue
+      elif [ "$want" = "$have" ]; then
+        record ok "node major version $have matches $f"
+      else
+        record fail "node is v$have but $f asks for $want" "nvm install (reads $f), or install Node.js $want from https://nodejs.org/en/download"
+      fi
+    done
+  fi
+
+  if grep -q '"\(dev\)\{0,1\}[dD]ependencies"[[:space:]]*:' package.json 2>/dev/null; then
+    if [ -f .pnp.cjs ] || [ -f .pnp.js ]; then
+      record ok "dependencies managed by Yarn Plug'n'Play (no node_modules needed)"
+    elif [ -d node_modules ]; then
+      record ok "node_modules is present"
+    else
+      record fail "node_modules is missing (dependencies are not installed)" "$pm install"
+    fi
+  fi
+}
+
+project_checks() {
+  if [ -f package.json ]; then node_checks; fi
+
+  if [ -f pyproject.toml ] || [ -f requirements.txt ]; then
+    section "project: python"
+    if [ -f uv.lock ]; then
+      check_bin uv "install uv: https://docs.astral.sh/uv/getting-started/installation/"
+      check_bin python3 "uv python install"
+    else
+      check_bin python3 "install Python 3 from https://www.python.org/downloads/"
+    fi
+    if [ -f poetry.lock ]; then
+      check_bin poetry "install Poetry: https://python-poetry.org/docs/#installation"
+    fi
+  fi
+
+  if [ -f composer.json ]; then
+    section "project: php (composer.json)"
+    check_bin php "install PHP: https://www.php.net/downloads.php"
+    check_bin composer "install Composer: https://getcomposer.org/download/"
+    if grep -q '"require\(-dev\)\{0,1\}"[[:space:]]*:' composer.json 2>/dev/null \
+       && ! grep -q '"vendor-dir"' composer.json 2>/dev/null; then
+      if [ -d vendor ]; then
+        record ok "vendor is present"
+      else
+        record fail "vendor is missing (dependencies are not installed)" "composer install"
+      fi
+    fi
+  fi
+
+  if [ -f Gemfile ]; then
+    section "project: ruby (Gemfile)"
+    check_bin ruby "install Ruby: https://www.ruby-lang.org/en/documentation/installation/"
+    check_bin bundle "gem install bundler"
+  fi
+
+  if [ -f go.mod ]; then
+    section "project: go (go.mod)"
+    check_bin go "install Go from https://go.dev/dl/"
+  fi
+
+  if [ -f Cargo.toml ]; then
+    section "project: rust (Cargo.toml)"
+    check_bin cargo "install Rust with rustup: https://rustup.rs"
+  fi
+  return 0
+}
+
+# Zero-config env check: the first example file found, against .env.
+default_example() {
+  local f
+  for f in .env.example .env.sample .env.template; do
+    [ -f "$f" ] && { echo "$f"; return 0; }
+  done
+  return 1
+}
+
+# Other .env.* files (.env.local, .env.production, ...) are not compared with
+# anything, but a committed one is often a leaked one. Warnings, not failures:
+# some frameworks commit .env.production on purpose for public settings.
+other_env_files() {
+  local f
+  [ "$in_git" = 1 ] || return 0
+  for f in .env.*; do
+    [ -f "$f" ] || continue
+    case "$f" in *.example|*.sample|*.template|*.dist) continue ;; esac
+    case "$nl$env_actuals" in *"$nl$f$nl"*) continue ;; esac
+    section "env: other .env files"
+    if git ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then
+      record warn "$f is committed to git" \
+        "if it holds secrets: git rm --cached '$f', add it to .gitignore, and rotate them; if it holds only public settings, this is fine"
+    elif git check-ignore -q --no-index -- "$f" 2>/dev/null; then
+      record ok "$f is git-ignored"
+    else
+      record warn "$f is not git-ignored" \
+        "echo '$f' >> .gitignore (unless it holds only public settings and is meant to be committed)"
+    fi
+  done
+}
+
+# --- envready.conf ------------------------------------------------------------
+#
+#   kind  target  [-> fix]
+#
+# One check per line. Blank lines and lines starting with # are ignored. The
+# fix is everything after the first " -> " (spaces or tabs around the arrow);
+# without one, a generic fix is printed. Targets may be wrapped in "double" or
+# 'single' quotes when they contain spaces.
+
+conf=envready.conf
+
+trim() {  # trim STRING: sets $trimmed
+  local s=$1
+  s=${s#"${s%%[![:space:]]*}"}
+  s=${s%"${s##*[![:space:]]}"}
+  trimmed=$s
+}
+
+unquote() {  # unquote STRING: sets $unquoted (one layer of matching quotes)
+  local s=$1
+  case "$s" in
+    \"*\"|\'*\') [ ${#s} -ge 2 ] && s=${s#?} && s=${s%?} ;;
+  esac
+  unquoted=$s
+}
+
+next_token() {  # next_token STRING: sets $tok and $rest
+  local s=$1 q
+  trim "$s"; s=$trimmed
+  case "$s" in
+    \"*|\'*)
+      q=${s%"${s#?}"}
+      s=${s#?}
+      case "$s" in
+        *"$q"*) tok=${s%%"$q"*}; s=${s#*"$q"} ;;
+        *)      tok=$s; s="" ;;
+      esac ;;
+    *)
+      tok=${s%%[[:space:]]*}
+      s=${s#"$tok"} ;;
+  esac
+  trim "$s"; rest=$trimmed
+}
+
+run_cmd() {
+  local c=$1 t=${ENVREADY_TIMEOUT:-10}
+  if has timeout; then
+    timeout "$t" sh -c "$c" </dev/null >/dev/null 2>&1
+  elif has gtimeout; then
+    gtimeout "$t" sh -c "$c" </dev/null >/dev/null 2>&1
+  else
+    sh -c "$c" </dev/null >/dev/null 2>&1
+  fi
+}
+
+var_check() {
+  local name=$1 fix=$2 f keys found=""
+  case "$name" in
+    ''|[!A-Za-z_]*|*[!A-Za-z0-9_]*)
+      record fail "$conf line $lineno: \"$name\" is not a valid variable name" "use letters, digits and _ only, not starting with a digit"
+      return 0 ;;
+  esac
+  [ -n "$fix" ] || fix="add a line $name=<value> to .env, or export $name in your shell"
+  if in_environment "$name"; then
+    record ok "$name is set (environment)"
+    return 0
+  fi
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$f" ] || continue
+    keys=$(env_keys "$f")
+    case "$nl$keys$nl" in
+      *"$nl$name${tab}1$nl"*) record ok "$name is set ($f)"; return 0 ;;
+      *"$nl$name${tab}0$nl"*) found=$f ;;
+    esac
+  done <<EOF
+.env
+$env_actuals
+EOF
+  if [ -n "$found" ]; then
+    record fail "$name is empty in $found" "$fix"
+  else
+    record fail "$name is not set" "$fix"
+  fi
+}
+
+# process_conf PASS: PASS "env" runs the env lines, "rest" everything else
+# (and reports malformed lines), so env sections come before the others.
+process_conf() {
+  local pass=$1 raw line kind target fix rc ex act
+  lineno=0
+  while IFS= read -r raw <&3 || [ -n "$raw" ]; do
+    lineno=$((lineno + 1))
+    trim "${raw%"$cr"}"; line=$trimmed
+    case "$line" in ''|'#'*) continue ;; esac
+
+    kind=${line%%[[:space:]]*}
+    target=${line#"$kind"}
+    fix=""
+    case "$target" in
+      *[[:space:]]"->"[[:space:]]*|*[[:space:]]"->")
+        fix=${target#*[[:space:]]"->"}
+        target=${target%%[[:space:]]"->"*} ;;
+    esac
+    trim "$target"; target=$trimmed
+    trim "$fix"; unquote "$trimmed"; fix=$unquoted
+
+    if [ "$pass" = env ]; then
+      [ "$kind" = env ] || continue
+      next_token "$target"; ex=$tok
+      next_token "$rest"; act=${tok:-.env}
+      if [ -z "$ex" ]; then
+        section "envready.conf"
+        record fail "$conf line $lineno: env needs an example file" "write it as: env .env.example .env"
+        continue
+      fi
+      env_compare "$ex" "$act"
+      continue
+    fi
+
+    [ "$kind" = env ] && continue
+    section "envready.conf"
+    if [ -z "$target" ]; then
+      record fail "$conf line $lineno: \"$kind\" has nothing to check" "write it as: $kind <target> -> <fix>"
+      continue
+    fi
+    case "$kind" in
+      bin)
+        unquote "$target"
+        check_bin "$unquoted" "${fix:-install $unquoted and make sure it is on PATH}" ;;
+      file)
+        unquote "$target"
+        if [ -e "$unquoted" ]; then
+          record ok "$unquoted exists"
+        else
+          record fail "$unquoted does not exist" "${fix:-create $unquoted}"
+        fi ;;
+      var)
+        unquote "$target"
+        var_check "$unquoted" "$fix" ;;
+      cmd)
+        if [ "$nocmd" = 1 ]; then
+          record warn "skipped (--no-cmd): $target" "run envready without --no-cmd to check it"
+          continue
+        fi
+        run_cmd "$target"; rc=$?
+        if [ "$rc" = 0 ]; then
+          record ok "$target"
+        elif [ "$rc" = 124 ]; then
+          record fail "$target (timed out after ${ENVREADY_TIMEOUT:-10}s)" "${fix:-run it yourself to see why: $target}"
+        else
+          record fail "$target (exit $rc)" "${fix:-run it yourself to see why: $target}"
+        fi ;;
+      *)
+        record fail "$conf line $lineno: unknown kind \"$kind\"" "use one of: bin cmd env file var" ;;
+    esac
+  done 3< "$conf"
+}
+
+# --- --init -------------------------------------------------------------------
+
+init_conf() {
+  local ex body detected="" suggest=""
+  if [ -e "$conf" ]; then
+    echo "envready: $conf already exists in $here; not overwriting it" >&2
+    exit 1
+  fi
+  [ -f package.json ] && detected="$detected node"
+  { [ -f pyproject.toml ] || [ -f requirements.txt ]; } && detected="$detected python"
+  [ -f composer.json ] && detected="$detected php"
+  [ -f Gemfile ] && detected="$detected ruby"
+  [ -f go.mod ] && detected="$detected go"
+  [ -f Cargo.toml ] && detected="$detected rust"
+
+  [ -d .github ] && suggest="${suggest}bin      gh                   -> https://cli.github.com$nl"
+  [ -f supabase/config.toml ] && suggest="${suggest}bin      supabase             -> npm install -g supabase$nl"
+  [ -f vercel.json ] && suggest="${suggest}bin      vercel               -> npm install -g vercel$nl"
+  [ -f netlify.toml ] && suggest="${suggest}bin      netlify              -> npm install -g netlify-cli$nl"
+  { [ -f wrangler.toml ] || [ -f wrangler.jsonc ] || [ -f wrangler.json ]; } && suggest="${suggest}bin      wrangler             -> npm install -g wrangler$nl"
+  [ -f fly.toml ] && suggest="${suggest}bin      flyctl               -> https://fly.io/docs/flyctl/install/$nl"
+  [ -f firebase.json ] && suggest="${suggest}bin      firebase             -> npm install -g firebase-tools$nl"
+  [ -f Makefile ] && suggest="${suggest}bin      make                 -> install your system's build tools (macOS: xcode-select --install)$nl"
+  if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ] || [ -f compose.yml ] || [ -f compose.yaml ]; then
+    suggest="${suggest}bin      docker               -> https://docs.docker.com/get-docker/$nl"
+    suggest="${suggest}cmd      docker info          -> start Docker Desktop (or the Docker daemon)$nl"
+  fi
+
+  body="# envready.conf: what this project needs to run, one check per line.
+# Read by envready (https://github.com/piorkowm/envready). Commit this file.
+#
+#   kind   target                 -> fix (printed when the check fails)
+#
+#   bin    NAME                   NAME is on PATH
+#   cmd    COMMAND                COMMAND exits 0 (output hidden, ${ENVREADY_TIMEOUT:-10}s timeout)
+#   env    EXAMPLE [ACTUAL]       every key in EXAMPLE is set in ACTUAL (default .env)
+#   file   PATH                   PATH exists (file or directory)
+#   var    NAME                   NAME is set in the environment or in .env
+#
+# Checked without any config:${detected:- nothing detected}${detected:+ (tools, versions, installed dependencies)}
+"
+  if ex=$(default_example); then
+    body="$body
+env      $ex .env
+"
+  fi
+  if [ -n "$suggest" ]; then
+    body="$body
+# Detected in this project:
+$suggest"
+  fi
+  body="$body
+# Examples (remove the # to use one):
+# cmd      gh auth status       -> gh auth login
+# file     .claude/settings.json -> copy it from .claude/settings.example.json
+# var      OPENAI_API_KEY       -> add it to .env (see https://platform.openai.com/api-keys)
+"
+  if ! ( set -o noclobber; printf '%s' "$body" > "$conf" ) 2>/dev/null; then
+    echo "envready: could not write $conf in $here (it may exist already)" >&2
+    exit 1
+  fi
+  echo "envready: wrote $here/$conf; edit it, commit it, then run envready"
+  exit 0
+}
+
+[ "$init" = 1 ] && init_conf
+
+# --- run ----------------------------------------------------------------------
+
+[ "$json" = 1 ] || [ "$quiet" = 1 ] || printf 'envready %s: %s\n' "$version" "$here"
+
+project_checks
+
+has_conf=0
+conf_has_env=0
+if [ -f "$conf" ]; then
+  has_conf=1
+  grep -q '^[[:space:]]*env[[:space:]]' "$conf" && conf_has_env=1
+fi
+
+if [ "$conf_has_env" = 1 ]; then
+  process_conf env
+elif example=$(default_example); then
+  env_compare "$example" .env
+elif [ -f .env ]; then
+  section "env: .env"
+  record warn ".env exists but there is no .env.example" \
+    "create .env.example with the same keys and no values, so the next person knows what to fill in"
+  env_actuals=".env$nl"
+  git_secret_file .env
+fi
+other_env_files
+
+[ "$has_conf" = 1 ] && process_conf rest
+
+total=$((n_pass + n_fail + n_warn))
+if [ "$total" = 0 ]; then
+  section "envready"
+  record fail "nothing to check in $here (no envready.conf, no .env.example, no known project files)" \
+    "run envready from the project's root folder, or describe what it needs with: envready --init"
+  total=1
+fi
+
+if [ "$json" = 1 ]; then
+  json_esc "$here"
+  ready=true; [ "$n_fail" = 0 ] || ready=false
+  printf '{"tool":"envready","version":"%s","dir":"%s","ready":%s,"pass":%d,"fail":%d,"warn":%d,"checks":[%s]}\n' \
+    "$version" "$esc" "$ready" "$n_pass" "$n_fail" "$n_warn" "$json_items"
+elif [ "$quiet" = 0 ]; then
+  printf '\n'
+  warns=""
+  [ "$n_warn" -gt 0 ] && warns=", $n_warn warning"
+  [ "$n_warn" -gt 1 ] && warns="${warns}s"
+  checks=checks; [ "$n_pass" = 1 ] && checks=check
+  if [ "$n_fail" = 0 ]; then
+    printf '%sready%s: %d %s passed%s\n' "$c_ok" "$c_off" "$n_pass" "$checks" "$warns"
+  else
+    printf '%snot ready%s: %d failed, %d passed%s. Fix each FAIL above, then run envready again.\n' \
+      "$c_fail" "$c_off" "$n_fail" "$n_pass" "$warns"
+  fi
+fi
+
+[ "$n_fail" = 0 ]
